@@ -1,0 +1,20 @@
+{
+    "version": 2,
+    "commands": [
+        {
+            "id": "jrope.bouncelayers.bounce",
+            "displayName": "Bounce Layers to Single Layer",
+            "defaultShortcut": "",
+            "program": "C:\\Program Files\\Python314\\python.exe",
+            "args": "\"${CurrentCommandDirectory}\\jrope_BounceLayers.py\" ${id}",
+            "cwd": "${CurrentCommandDirectory}",
+            "redirectOutputs": true,
+            "startMode": "SingleSelectionSingleProcess",
+            "contextMenu": {
+                "basePath": "JROPE",
+                "visibleFor": "BlendContainer,RandomSequenceContainer,SwitchContainer",
+                "enabledFor": "BlendContainer,RandomSequenceContainer,SwitchContainer"
+            }
+        }
+    ]
+}
