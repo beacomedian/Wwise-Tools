@@ -225,10 +225,10 @@ def resolve_target(client: WaapiClient, target_id: str | None) -> Target:
         override_output=bool(row.get("@OverrideOutput")),
     )
 
-    # Immediate child containers = the "sources" that will be bounced/disabled.
+
     tgt.sources = waql(
         client,
-        f'$ "{target_id}" select children where type != "Sound"',
+        f'$ "{target_id}" select children',
         ["id", "name", "type", "path"],
     )
 
@@ -558,14 +558,14 @@ def apply_post_import_compensation(client: WaapiClient, comp_id: str,
 # ---------------------------------------------------------------------------
 
 def disable_sources(client: WaapiClient, tgt: Target) -> None:
-    """Group the bounced source containers into a `PRECOMP_NAME` container created
+    """Group the bounced source layers into a `PRECOMP_NAME` container created
     INSIDE the target, and set its Inclusion=false — so they leave the target's
     live structure and drop out of SoundBanks (Inclusion is hierarchical, so one
     flag covers them all), while staying in the project as an editable backup.
     A container (not a Folder) is used because a Folder can't nest inside a
     playback container and Wwise would relocate it outside the target."""
     if not tgt.sources:
-        log("No source child-containers to disable.")
+        log("No source layers to disable.")
         return
 
     precomp = client.call("ak.wwise.core.object.create", {
@@ -980,7 +980,7 @@ def _run(client: WaapiClient, args) -> int:
     try:
         tgt = resolve_target(client, _clean_guid(args.target))
         log(f"Target: {tgt.name} ({tgt.type}); "
-            f"{len(tgt.sources)} source child-container(s); "
+            f"{len(tgt.sources)} source layer(s); "
             f"infinite-loop={tgt.has_infinite_loop}")
         for d in tgt.looping_sources:
             if not d.get("_active"):
