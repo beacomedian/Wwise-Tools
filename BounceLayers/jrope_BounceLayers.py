@@ -19,7 +19,9 @@
     #      is made once by hand -- a WAAPI-created bus does not engage Wwise's
     #      live audio render.)
     #   5. Drive the transport N times, writing one finalized WAV per take.
-    #   6. Import the takes into a new "<Name>_COMP" Random container child.
+    #   6. Import the takes into a new "<Name>_COMP" Random container child
+    #      (a single take is imported as a Sound child of the target instead --
+    #      there is nothing to randomize between).
     #   7. (unless --dry-run) Group the original source containers into a disabled
     #      "preComp" container inside the target (Inclusion off -> excluded).
     #   8. Restore the target's original routing, disconnect.
@@ -39,6 +41,8 @@ if __name__ != '__main__':
     exit(1)
 
 import argparse
+import array
+import math
 import os
 import re
 import sys
@@ -85,6 +89,25 @@ DEFAULT_VARIATIONS = 5
 #            Voice Volume to cancel the inherited gain. Never clips.
 #   "off"  - no compensation.
 VOLUME_COMPENSATION = "pre"
+
+# Positioning neutralization. The capture is a voice, so the target's Positioning
+# is baked into the take -- distance attenuation (volume, filtering, aux sends) and
+# 3D spatialization as evaluated at the transport's listener position -- AND applied
+# a second time when the _COMP plays back under the same hierarchy. When True, the
+# target's positioning is overridden and flattened for the capture, then restored
+# exactly in teardown. The Attenuation ShareSet REFERENCE is never touched, only the
+# enable flags: losing that pointer is the one failure here that can't be undone.
+NEUTRALIZE_POSITIONING = True
+
+# What each neutralized property is set to for the capture. Names and types verified
+# live on 2025.1.8 (3DSpatialization is an int16; 0 = None). ListenerRelativeRouting
+# gates the whole 3D chain, so attenuation stays off even if the EnableAttenuation
+# write is the one that fails.
+POSITIONING_CAPTURE_VALUES = {
+    "ListenerRelativeRouting": False,
+    "EnableAttenuation": False,
+    "3DSpatialization": 0,
+}
 # ---------------------------------------------------------------------------
 
 WAAPI_URL = "ws://127.0.0.1:8080/waapi"
@@ -114,11 +137,24 @@ SCRATCH_DIR = os.path.join(
 
 # Timing (seconds).
 TRANSPORT_POLL = 0.1        # how often to poll transport state
-IDLE_TAIL = 0.6             # extra time recorded after the object goes idle (tail)
+IDLE_TAIL = 0.5             # extra time recorded after the object goes idle (tail)
 INTER_TAKE_PAUSE = 0.25     # settle time between takes
 AUTO_MAX_DURATION = 60.0    # safety cap when auto-stopping (one-shots/finite loops
                             # play out before this; guards an undetected inf. loop)
 WARMUP_TIMEOUT = 3.0        # max wait for transport to reach "playing"
+
+# Post-capture silence trim. The lead is trimmed so the bounce starts on time; the
+# tail only well below audibility, with a hold after the last audible frame and a
+# fade where the cut lands in audio. One shared -36 dBFS threshold used to do both
+# ends, which deleted the quiet half of every decay -- takes measurably ended at
+# exactly -36.0 dBFS, mid-tail.
+TRIM_LEAD_DB = -60.0        # head silence before/below this is removed
+TRIM_LEAD_PREROLL_MS = 0    # kept before the first audible frame (soft attacks)
+TRIM_TAIL_DB = -50.0        # tail silence after/below this is removed
+TRIM_TAIL_HOLD_MS = 25      # offset from TRIM_TAIL_DB position
+TRIM_FADE_MS = 25           # fade applied when the take ends in audible signal
+TRUNCATION_WARN_DB = -45.0  # warn if a take was cut while still this loud, catches
+                            # baked reverb tails
 
 # Container object types we accept as a bounce target.
 CONTAINER_TYPES = {
@@ -155,6 +191,9 @@ class Target:
     hierarchy_gain: float = 0.0            # sum of Volume+MakeUpGain, target + ancestors
     volume_chain: list[dict] = field(default_factory=list)  # for logging
     pre_comp_applied: bool = False         # was the target volume boosted for capture?
+    positioning: dict = field(default_factory=dict)   # original @props (to restore)
+    positioning_applied: bool = False      # was the positioning neutralized?
+    positioning_descendants: list[dict] = field(default_factory=list)  # override their own
 
 
 @dataclass
@@ -199,6 +238,7 @@ def resolve_target(client: WaapiClient, target_id: str | None) -> Target:
     fields = [
         "id", "name", "type", "path", "parent",
         "@OverrideOutput", "@OutputBus", "@Volume",
+        "@OverridePositioning", *(f"@{p}" for p in POSITIONING_CAPTURE_VALUES),
     ]
     rows = waql(client, f'$ "{target_id}"', fields)
     if not rows:
@@ -225,7 +265,10 @@ def resolve_target(client: WaapiClient, target_id: str | None) -> Target:
         override_output=bool(row.get("@OverrideOutput")),
     )
 
-
+    # Every immediate child -- containers AND loose Sounds -- is a "source" that
+    # will be bounced and then disabled. A loose Sound routes through the target's
+    # (rerouted) output like any layer, so it IS captured; leaving it live would
+    # play it a second time on top of the comp.
     tgt.sources = waql(
         client,
         f'$ "{target_id}" select children',
@@ -275,6 +318,16 @@ def resolve_target(client: WaapiClient, target_id: str | None) -> Target:
         ["id", "name", "type", "@OutputBus"],
     )
 
+    # Descendants that override positioning keep their OWN attenuation and
+    # spatialization no matter what we do to the target, so they bake it into the
+    # bounce. We don't touch them (that would multiply the restore surface) -- we
+    # say so, like the output-bus override warning above.
+    tgt.positioning_descendants = waql(
+        client,
+        f'$ "{target_id}" select descendants where @OverridePositioning = true',
+        ["id", "name", "type", "@EnableAttenuation", "@Attenuation"],
+    )
+
     # Trace the target + ancestors and sum the per-voice hierarchy gain (Voice
     # Volume + Make-Up Gain). This is baked into the bounce and re-applied when
     # the _COMP is re-imported under the same hierarchy, so the tool compensates
@@ -289,6 +342,13 @@ def resolve_target(client: WaapiClient, target_id: str | None) -> Target:
         for r in tgt.volume_chain
     )
     tgt.own_volume = row.get("@Volume") or 0.0
+
+    # Snapshot the positioning we are about to flatten for the capture, so teardown
+    # can write back whatever combination of override/enabled it was in.
+    tgt.positioning = {
+        p: row.get(f"@{p}")
+        for p in ("OverridePositioning", *POSITIONING_CAPTURE_VALUES)
+    }
 
     # Mirror the Originals subfolder from an existing descendant Sound so the
     # baked WAVs land next to the sources they replace.
@@ -419,7 +479,11 @@ def capture_takes(client: WaapiClient, tgt: Target, rig: CaptureRig,
     take_files: list[str] = []
     try:
         for i in range(1, opts.variations + 1):
-            out = os.path.join(SCRATCH_DIR, f"{safe}{COMP_SUFFIX}_{i:02d}.wav")
+            # A lone take is imported as a Sound directly under the target, so
+            # its stem becomes that object's name -- no "_01" on a single bounce.
+            stem = (f"{safe}{COMP_SUFFIX}" if opts.variations == 1
+                    else f"{safe}{COMP_SUFFIX}_{i:02d}")
+            out = os.path.join(SCRATCH_DIR, f"{stem}.wav")
             if os.path.exists(out):
                 os.remove(out)
             _set_recorder_output(client, rig, out)
@@ -437,6 +501,7 @@ def capture_takes(client: WaapiClient, tgt: Target, rig: CaptureRig,
 
             if os.path.exists(out):
                 take_files.append(out)
+                _warn_if_truncated(out, i)
             else:
                 log(f"  WARNING: no file written for take {i} (see VERIFY-LIVE).")
     finally:
@@ -481,14 +546,22 @@ def _state(client: WaapiClient, transport_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def import_takes(client: WaapiClient, tgt: Target, take_files: list[str]) -> str:
+    """Import the takes and return the id of the object that carries the bounce.
+    Several takes go into a new "<Name>_COMP" Random container; a single take has
+    nothing to randomize between, so the Sound is imported straight under the
+    target instead -- a sibling of the PRECOMP container."""
+    single = len(take_files) == 1
     comp = f"{_safe_name(tgt.name)}{COMP_SUFFIX}"
     subfolder = tgt.originals_subfolder or _safe_name(tgt.name)
     imports = []
     for wav in take_files:
         stem = os.path.splitext(os.path.basename(wav))[0]
+        if single:
+            comp = stem                    # the Sound itself is the comp object
         imports.append({
             "audioFile": wav,
             "objectPath": (
+                f"{tgt.path}\\<Sound SFX>{stem}" if single else
                 f"{tgt.path}\\<Random Container>{comp}\\<Sound SFX>{stem}"
             ),
             "originalsSubFolder": subfolder,
@@ -498,7 +571,10 @@ def import_takes(client: WaapiClient, tgt: Target, take_files: list[str]) -> str
         "default": {"importLanguage": "SFX"},
         "imports": imports,
     })
-    log(f"Imported {len(take_files)} takes into '{comp}'")
+    if single:
+        log(f"Imported 1 take as '{comp}' under the target")
+    else:
+        log(f"Imported {len(take_files)} takes into '{comp}'")
     rows = waql(client, f'$ "{tgt.id}" select children where name = "{comp}"', ["id"])
     return rows[0]["id"] if rows else ""
 
@@ -512,6 +588,30 @@ def _compensation(tgt: Target) -> float:
     of the summed hierarchy voice gain (Volume + Make-Up Gain, target+ancestors),
     which the bounce bakes in and the re-import re-applies."""
     return -tgt.hierarchy_gain
+
+
+def apply_positioning_neutralization(client: WaapiClient, tgt: Target) -> None:
+    """Override the target's positioning and flatten it (attenuation off, no 3D) so
+    the capture is dry. teardown() restores the snapshot taken in resolve_target().
+    The override flag goes on FIRST so the value writes land on the target's own
+    storage rather than being inherited, and `positioning_applied` is set the moment
+    it succeeds -- a failure half way through still gets a full restore."""
+    if not NEUTRALIZE_POSITIONING or not tgt.positioning:
+        return
+    client.call("ak.wwise.core.object.setProperty",
+                {"object": tgt.id, "property": "OverridePositioning",
+                 "value": True})
+    tgt.positioning_applied = True
+    for prop, value in POSITIONING_CAPTURE_VALUES.items():
+        try:
+            client.call("ak.wwise.core.object.setProperty",
+                        {"object": tgt.id, "property": prop, "value": value})
+        except Exception as e:
+            # An ActorMixer target, or a later Wwise version, may not carry every
+            # property -- skip it rather than abort the bounce.
+            log(f"WARNING: could not set {prop} for the capture: {e}")
+    was = ", ".join(f"{p}={tgt.positioning.get(p)}" for p in tgt.positioning)
+    log(f"Positioning neutralized for capture (was {was})")
 
 
 def apply_pre_bounce_compensation(client: WaapiClient, tgt: Target,
@@ -602,6 +702,19 @@ def teardown(client: WaapiClient, tgt: Target, rig: CaptureRig | None) -> None:
             log(f"Restored target Voice Volume ({tgt.own_volume:+.2f} dB)")
         except Exception as e:
             log(f"WARNING: could not restore target Voice Volume: {e}")
+    # Restore the positioning we flattened for the capture. Values first, while
+    # OverridePositioning is still on so they land on the target's own storage;
+    # the override flag goes back last. If it was originally off, the values are
+    # inert once it is off again -- so a failed value restore changes nothing.
+    if tgt is not None and tgt.positioning_applied:
+        for prop in list(POSITIONING_CAPTURE_VALUES) + ["OverridePositioning"]:
+            try:
+                client.call("ak.wwise.core.object.setProperty",
+                            {"object": tgt.id, "property": prop,
+                             "value": tgt.positioning[prop]})
+            except Exception as e:
+                log(f"WARNING: could not restore {prop}: {e}")
+        log("Restored target positioning")
     if rig is None:
         return
     # Restore the target's original routing (order: set bus while overriding,
@@ -635,8 +748,56 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_") or "Container"
 
 
+def _read_wav16(path: str):
+    """Read a WAV as (params, array('h')). The sample array is None for anything
+    that isn't 16-bit -- the only width handled here (stdlib only, no numpy)."""
+    with wave.open(path, "rb") as w:
+        params = w.getparams()
+        frames = w.readframes(w.getnframes())
+    if params.sampwidth != 2:
+        return params, None
+    a = array.array("h")
+    a.frombytes(frames)
+    return params, a
+
+
+def _peak_db(samples) -> float:
+    peak = max((abs(v) for v in samples), default=0)
+    return -99.0 if peak <= 0 else 20.0 * math.log10(peak / 32768.0)
+
+
+def _db_to_sample(db: float) -> int:
+    return int(10.0 ** (db / 20.0) * 32768.0)
+
+
+def _end_level_db(path: str, ms: int = 10) -> float:
+    """Peak level of a take's last `ms`, in dBFS. Loud means the recording stopped
+    while the sound was still going."""
+    params, a = _read_wav16(path)
+    if not a:
+        return -99.0
+    ch = params.nchannels
+    k = min(len(a) // ch, max(1, int(params.framerate * ms / 1000)))
+    return _peak_db(a[len(a) - k * ch:])
+
+
+def _warn_if_truncated(path: str, take: int) -> None:
+    """Flag a take that was still sounding when the recording stopped -- i.e. the
+    capture cut it, which no amount of trimming can put back."""
+    try:
+        end_db = _end_level_db(path)
+    except Exception:
+        return
+    if end_db > TRUNCATION_WARN_DB:
+        log(f"  WARNING: take {take} ends at {end_db:.1f} dBFS -- still sounding "
+            f"when the recording stopped. Raise IDLE_TAIL (currently "
+            f"{IDLE_TAIL}s) or the record length.")
+
+
 def _trim_wavs(files: list[str]) -> None:
-    """Best-effort lead/tail silence trim (stdlib only, no numpy dependency)."""
+    """Best-effort silence trim: lead below TRIM_LEAD_DB, tail below TRIM_TAIL_DB
+    with TRIM_TAIL_HOLD_MS kept after the last audible frame, plus a fade where the
+    take ends in audible signal. 16-bit only; anything else is logged and skipped."""
     for f in files:
         try:
             _trim_one(f)
@@ -644,26 +805,48 @@ def _trim_wavs(files: list[str]) -> None:
             log(f"  (trim skipped for {os.path.basename(f)}: {e})")
 
 
-def _trim_one(path: str, thresh: int = 512) -> None:
-    with wave.open(path, "rb") as w:
-        params = w.getparams()
-        frames = w.readframes(w.getnframes())
-    if params.sampwidth != 2:
-        return  # only handle 16-bit here; leave others untouched
-    import array
-    a = array.array("h")
-    a.frombytes(frames)
-    ch = params.nchannels
-    # find first/last frame above threshold
-    n = len(a) // ch
-    first, last = 0, n - 1
-    while first < n and max(abs(a[first * ch + c]) for c in range(ch)) < thresh:
-        first += 1
-    while last > first and max(abs(a[last * ch + c]) for c in range(ch)) < thresh:
-        last -= 1
-    if first == 0 and last == n - 1:
+def _trim_one(path: str) -> None:
+    params, a = _read_wav16(path)
+    if a is None:
+        log(f"  (trim skipped for {os.path.basename(path)}: "
+            f"{params.sampwidth * 8}-bit, only 16-bit is handled)")
         return
+    ch, sr = params.nchannels, params.framerate
+    n = len(a) // ch
+    if n == 0:
+        return
+
+    lead_thresh = _db_to_sample(TRIM_LEAD_DB)
+    tail_thresh = _db_to_sample(TRIM_TAIL_DB)
+    first = 0
+    while first < n and max(abs(a[first * ch + c]) for c in range(ch)) < lead_thresh:
+        first += 1
+    if first >= n:                      # wholly silent take -- leave it alone
+        return
+    last = n - 1
+    while last > first and max(abs(a[last * ch + c]) for c in range(ch)) < tail_thresh:
+        last -= 1
+
+    # Keep a little before the first audible frame (soft attacks) and a hold after
+    # the last one, so a decay is never cut at the point it drops below threshold.
+    first = max(0, first - int(sr * TRIM_LEAD_PREROLL_MS / 1000))
+    last = min(n - 1, last + int(sr * TRIM_TAIL_HOLD_MS / 1000))
     sliced = a[first * ch:(last + 1) * ch]
+
+    # The take ends in audible signal -- either the hold ran past the end of the
+    # file (the capture itself cut it) or the tail is still ringing. Fade the last
+    # few ms rather than leaving a click in the imported file.
+    ends_hot = max(abs(sliced[len(sliced) - ch + c]) for c in range(ch)) >= tail_thresh
+    if first == 0 and last == n - 1 and not ends_hot:
+        return
+    if ends_hot:
+        k = min(len(sliced) // ch, max(1, int(sr * TRIM_FADE_MS / 1000)))
+        base = len(sliced) - k * ch
+        for i in range(k):
+            gain = 1.0 - (i + 1) / k
+            for c in range(ch):
+                sliced[base + i * ch + c] = int(sliced[base + i * ch + c] * gain)
+
     with wave.open(path, "wb") as w:
         w.setparams(params)
         w.writeframes(sliced.tobytes())
@@ -734,6 +917,17 @@ def prompt_options(tgt: Target, args) -> RunOptions:
                   f"{names}{more}"))
         warn.grid(column=0, row=5, columnspan=2, sticky="w", pady=(8, 0))
 
+    if NEUTRALIZE_POSITIONING and tgt.positioning_descendants:
+        names = "\n".join(f"  • {d['name']}"
+                          for d in tgt.positioning_descendants[:6])
+        more = ("\n  …" if len(tgt.positioning_descendants) > 6 else "")
+        pos_warn = tk.Label(
+            frm, justify="left", fg="#b00",
+            text=(f"⚠ {len(tgt.positioning_descendants)} descendant(s) override "
+                  f"their own Positioning,\nso their attenuation/spatialization IS "
+                  f"baked into the bounce:\n{names}{more}"))
+        pos_warn.grid(column=0, row=6, columnspan=2, sticky="w", pady=(8, 0))
+
     def ok():
         result["variations"] = max(1, int(var_n.get()))
         result["record_length"] = (
@@ -748,7 +942,7 @@ def prompt_options(tgt: Target, args) -> RunOptions:
         root.destroy()
 
     btns = ttk.Frame(frm)
-    btns.grid(column=0, row=6, columnspan=2, sticky="ew", pady=(12, 0))
+    btns.grid(column=0, row=7, columnspan=2, sticky="ew", pady=(12, 0))
     # "?" help button at the bottom-left; opens the tutorial window.
     ttk.Button(btns, text="?", width=3,
                command=lambda: _show_help(root, tgt)).grid(
@@ -825,9 +1019,17 @@ def _show_help(parent, tgt: Target) -> None:
     b("Temporarily reroutes the target's Output Bus to a dedicated capture bus "
       "(\"" + CAPTURE_BUS_NAME + "\"), so "
       "the layers are summed protected from adjustments in the mix structure.")
+    b("Temporarily overrides the target's Positioning and flattens it "
+      "(attenuation and 3D spatialization off) so the bounce is captured dry, "
+      "then restores it exactly. The Attenuation ShareSet itself is never "
+      "changed. Descendants that override their OWN positioning are left alone, "
+      "so their attenuation does get baked in — the dialog warns when there "
+      "are any.")
     b("Transport triggers the target N times.")
     b(f"Imports the takes into a new Random container \"<Name>{COMP_SUFFIX}\" "
-      f"under the target (takes named \"<Name>{COMP_SUFFIX}_01\", _02, …).")
+      f"under the target (takes named \"<Name>{COMP_SUFFIX}_01\", _02, …). "
+      f"A single variation skips the container: the take is imported as a Sound "
+      f"named \"<Name>{COMP_SUFFIX}\" directly under the target.")
     b(f"Groups the original source layers into a disabled \"{PRECOMP_NAME}\" "
       f"container inside the target. ")
     b("Restores the target's routing and volume")
@@ -997,6 +1199,13 @@ def _run(client: WaapiClient, args) -> int:
             for d in tgt.rerouting_descendants:
                 bus = (d.get("@OutputBus") or {}).get("name", "?")
                 log(f"    - {d['name']} ({d['type']}) -> {bus}")
+        if NEUTRALIZE_POSITIONING and tgt.positioning_descendants:
+            log("WARNING: these descendants override their own Positioning and "
+                "keep their attenuation/spatialization in the bounce. Clear those "
+                "overrides to capture them flat:")
+            for d in tgt.positioning_descendants:
+                att = (d.get("@Attenuation") or {}).get("name", "none")
+                log(f"    - {d['name']} ({d['type']}) -> attenuation {att}")
 
         if VOLUME_COMPENSATION != "off" and abs(tgt.hierarchy_gain) > 1e-6:
             log(f"Hierarchy voice gain (Volume+Make-Up over target+ancestors): "
@@ -1011,6 +1220,7 @@ def _run(client: WaapiClient, args) -> int:
         client.call("ak.wwise.core.undo.beginGroup", {})
         undo_open = True
         rig = build_capture_rig(client, tgt)
+        apply_positioning_neutralization(client, tgt)
         apply_pre_bounce_compensation(client, tgt, opts)
         takes = capture_takes(client, tgt, rig, opts)
         if not takes:
